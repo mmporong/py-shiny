@@ -1702,33 +1702,6 @@ def format_reactlog_html(
       fitGraph();
     }}
 
-    function prepareEventTimings() {{
-      const events = reactlogData.events || reactlogData.log || [];
-      if (!events || events.length === 0) return;
-
-      let i = 0;
-      while (i < events.length) {{
-        const baseTime = events[i].time_sec !== undefined ? events[i].time_sec : (events[i].time !== undefined ? events[i].time : 0);
-        let j = i;
-        while (j < events.length && Math.abs(((events[j].time_sec !== undefined ? events[j].time_sec : events[j].time) || 0) - baseTime) < 0.04) {{
-          j++;
-        }}
-        const clusterLen = j - i;
-        const nextTime = (j < events.length && (events[j].time_sec !== undefined || events[j].time !== undefined)) ? (events[j].time_sec ?? events[j].time) : (baseTime + 1.2);
-        const windowDuration = Math.min(0.75, Math.max(0.25, (nextTime - baseTime) * 0.7));
-
-        for (let k = 0; k < clusterLen; k++) {{
-          const evIdx = i + k;
-          if (events[evIdx].time_sec !== undefined || events[evIdx].time !== undefined) {{
-            events[evIdx].effective_time = baseTime + (clusterLen > 1 ? (k / (clusterLen - 1)) * windowDuration : 0);
-          }} else {{
-            events[evIdx].effective_time = baseTime;
-          }}
-        }}
-        i = j;
-      }}
-    }}
-
     function filterItems(arr, predicate) {{
       const out = [];
       for (const item of (arr || [])) {{
@@ -1861,7 +1834,9 @@ def format_reactlog_html(
     }}
 
     function buildActionWaves() {{
-      if (reactlogData.action_waves && reactlogData.action_waves.length > 0) {{
+      const events = reactlogData.events || reactlogData.log || [];
+      const hasFlushBoundaries = events.some(ev => (ev.action || ev.event) === 'queueEmpty');
+      if (!hasFlushBoundaries && reactlogData.action_waves && reactlogData.action_waves.length > 0) {{
         const rawWaves = reactlogData.action_waves;
         const coalesced = [];
         for (let i = 0; i < rawWaves.length; i++) {{
@@ -1880,7 +1855,6 @@ def format_reactlog_html(
       }}
       actionWaves = [];
       allBursts = [];
-      const events = reactlogData.events || reactlogData.log || [];
       const nodeMap = new Map();
       const lastKnownValues = new Map();
       const waveInitialValues = new Map();
@@ -1900,7 +1874,7 @@ def format_reactlog_html(
         const isInit = ev.phase === 'init' || ['define', 'analysisInit', 'createContext', 'sessionInit'].includes(evAction);
         const t = ev.time_sec !== undefined ? ev.time_sec : (ev.time !== undefined ? ev.time : 0);
 
-        if (isInit) {{
+        if (isInit && !hasFlushBoundaries) {{
           if (ev.value !== undefined && ev.value !== null) {{
             const initId = ev.node_id || ev.id || '';
             // Recorded inputs are named by label, as in the interaction branch below.
@@ -1942,16 +1916,10 @@ def format_reactlog_html(
             }}
           }}
         }} else {{
-          if (evAction === 'userMark' && ev.mark_wave) {{
-            // Same bookmark wave the server builds for generated reactlogs.
-            const markIdx = actionWaves.length + 1;
-            actionWaves.push(waveToBurst({{ ...ev.mark_wave, action_id: `mark-${{markIdx}}`, index: markIdx }}, markIdx));
-            curWave = null;
-            return;
-          }}
-          if (evAction === 'queueEmpty') {{
-            if (curWave) {{
-              curWave.endStep = idx;
+          if (evAction === 'userMark') {{
+            if (!hasFlushBoundaries && ev.mark_wave) {{
+              const markIdx = actionWaves.length + 1;
+              actionWaves.push(waveToBurst({{ ...ev.mark_wave, action_id: `mark-${{markIdx}}`, index: markIdx }}, markIdx));
               curWave = null;
             }}
             return;
@@ -1968,23 +1936,25 @@ def format_reactlog_html(
           const isExecution = evAction === 'enter' || evAction === 'recalculate' || evAction === 'output' || evAction === 'render';
           const isInvalidation = evAction === 'invalidate' || evAction === 'invalidateStart' || evAction === 'propagate' || ev.semantic_state === 'invalidated';
 
-          if (!curWave && !isUserAction && !isExecution && evAction !== 'userMark') {{
+          if (!hasFlushBoundaries && !curWave && !isUserAction && !isExecution) {{
             return;
           }}
 
-          if (!curWave || (t - curWave.startTime) > 0.25 || isNewTrigger) {{
+          if (!curWave || (!hasFlushBoundaries && ((t - curWave.startTime) > 0.25 || isNewTrigger))) {{
             curWave = {{
               id: `burst-${{actionWaves.length + 1}}`,
               index: actionWaves.length + 1,
-              isInit: false,
+              isInit: isInit,
+              recorded: hasFlushBoundaries,
+              completed: false,
               startTime: t,
               endTime: t,
               time: t,
               startStep: idx,
               endStep: idx,
-              triggerLabel: '',
-              shortLabel: '',
-              humanAction: '',
+              triggerLabel: isInit ? 'Init' : '',
+              shortLabel: isInit ? 'Init' : '',
+              humanAction: isInit ? 'Init' : '',
               triggerNodeId: '',
               triggerValue: ev.value,
               inputs: [],
@@ -2001,8 +1971,16 @@ def format_reactlog_html(
           curWave.endTime = t;
           curWave.totalEvents++;
 
+          if (evAction === 'queueEmpty') {{
+            curWave.completed = true;
+            curWave = null;
+            return;
+          }}
+
           if (isUserAction || nId.startsWith('input:') || isInputNode) {{
-            if (!raw.includes('clientdata') && !raw.includes('pixelratio') && !raw.includes('_hidden')) {{
+            if (isInit) {{
+              if (inputName && ev.value !== undefined && ev.value !== null) lastKnownValues.set(inputName, ev.value);
+            }} else if (!raw.includes('clientdata') && !raw.includes('pixelratio') && !raw.includes('_hidden')) {{
               const name = inputName || 'input';
               if (!waveInitialValues.has(curWave)) {{
                 waveInitialValues.set(curWave, new Map(lastKnownValues));
@@ -2055,7 +2033,7 @@ def format_reactlog_html(
         }}
       }});
 
-      actionWaves = filterItems(actionWaves, w => w.inputs.length > 0 || w.calcs.length > 0 || w.outputs.length > 0 || w.isMark || (w.invalidatedNodes && w.invalidatedNodes.size > 0));
+      actionWaves = filterItems(actionWaves, w => w.completed || w.inputs.length > 0 || w.calcs.length > 0 || w.outputs.length > 0 || w.isMark || (!hasFlushBoundaries && w.invalidatedNodes && w.invalidatedNodes.size > 0));
       actionWaves.forEach((w, i) => {{
         w.index = i + 1;
         w.id = `burst-${{i + 1}}`;
@@ -2081,6 +2059,7 @@ def format_reactlog_html(
       }});
 
       allBursts = (initWave && initWave.totalEvents > 0 ? [initWave] : []).concat(actionWaves);
+      actionWaves = filterItems(allBursts, w => !w.isInit && !w.isMark);
       if (allBursts.length === 0) {{
         allBursts = [{{
           id: 'burst-init',
@@ -2114,13 +2093,13 @@ def format_reactlog_html(
     function getCurrentStepTime() {{
       const events = reactlogData.events || reactlogData.log || [];
       const ev = events[currentStep];
-      return ev ? (ev.effective_time !== undefined ? ev.effective_time : ((ev.time_sec !== undefined ? ev.time_sec : ev.time) || 0)) : 0;
+      return ev ? (ev.time_sec ?? ev.time ?? 0) : 0;
     }}
 
     function initTraceTimeline() {{
       const events = reactlogData.events || reactlogData.log || [];
       const video = document.getElementById('session-video');
-      maxSessionDuration = events.reduce((max, ev) => Math.max(max, ev.effective_time ?? ev.time_sec ?? ev.time ?? 0), Number.isFinite(video?.duration) ? video.duration : 1);
+      maxSessionDuration = events.reduce((max, ev) => Math.max(max, ev.time_sec ?? ev.time ?? 0), Number.isFinite(video?.duration) ? video.duration : 1);
       document.getElementById('trace-total-time').textContent = formatTime(maxSessionDuration);
       const markers = document.getElementById('trace-markers');
       markers.replaceChildren();
@@ -2284,7 +2263,7 @@ def format_reactlog_html(
             break;
           }}
         }}
-        const invArray = [...new Set(Array.from(wave.invalidatedNodes).map(friendlyNodeName).filter(Boolean))];
+        const invArray = [...new Set(filterItems(Array.from(wave.invalidatedNodes).map(friendlyNodeName), Boolean))];
         let invLabel = '';
         if (invArray.length === 1) {{
           invLabel = invArray[0];
@@ -2304,16 +2283,15 @@ def format_reactlog_html(
       }}
 
       if (calcCount > 0) {{
-        let calcStep = waveStart;
+        let calcStep = wave.recorded ? null : waveStart;
         for (let s = waveStart; s <= waveEnd && s < events.length; s++) {{
           const ev = events[s];
           const act = ev.action || ev.event || '';
-          if (act === 'enter' && (ev.type === 'calc' || ev.node_type === 'conductor')) {{
+          if (act === 'exit' && (ev.type === 'calc' || ev.node_type === 'calc' || ev.node_type === 'conductor')) {{
             calcStep = s;
-            break;
           }}
         }}
-        const calcArray = [...new Set(wave.calcs.map(c => friendlyNodeName(c.nodeId || c.name || c.id)).filter(Boolean))];
+        const calcArray = [...new Set(filterItems(wave.calcs.map(c => friendlyNodeName(c.nodeId || c.name || c.id)), Boolean))];
         let calcLabel = '';
         if (calcArray.length === 1) {{
           calcLabel = calcArray[0];
@@ -2322,7 +2300,7 @@ def format_reactlog_html(
         }} else {{
           calcLabel = `${{calcArray.length}} calcs`;
         }}
-        stages.push({{
+        if (calcStep !== null) stages.push({{
           step: calcStep,
           kind: 'Calculated',
           label: calcLabel,
@@ -2333,16 +2311,15 @@ def format_reactlog_html(
       }}
 
       if (outCount > 0) {{
-        let outStep = waveStart;
+        let outStep = wave.recorded ? null : waveStart;
         for (let s = waveStart; s <= waveEnd && s < events.length; s++) {{
           const ev = events[s];
           const act = ev.action || ev.event || '';
-          if ((act === 'output' || act === 'render' || act === 'outputUpdated') || (act === 'enter' && (ev.type === 'output' || ev.node_type === 'observer'))) {{
+          if ((act === 'output' || act === 'render' || act === 'outputUpdated') || (act === 'exit' && (ev.type === 'output' || ev.node_type === 'output' || ev.node_type === 'observer'))) {{
             outStep = s;
-            break;
           }}
         }}
-        const outArray = [...new Set(wave.outputs.map(o => friendlyNodeName(o.nodeId || o.name || o.id)).filter(Boolean))];
+        const outArray = [...new Set(filterItems(wave.outputs.map(o => friendlyNodeName(o.nodeId || o.name || o.id)), Boolean))];
         let outLabel = '';
         if (outArray.length === 1) {{
           outLabel = outArray[0];
@@ -2351,7 +2328,7 @@ def format_reactlog_html(
         }} else {{
           outLabel = `${{outArray.length}} outputs`;
         }}
-        stages.push({{
+        if (outStep !== null) stages.push({{
           step: outStep,
           kind: 'Rendered',
           label: outLabel,
@@ -2361,14 +2338,16 @@ def format_reactlog_html(
         }});
       }}
 
-      stages.push({{
-        step: waveEnd,
-        kind: 'Settled',
-        label: 'Idle',
-        fullName: 'Flush complete / idle',
-        icon: ICONS.check,
-        cssClass: 'pill-idle'
-      }});
+      if (!wave.recorded || wave.completed) {{
+        stages.push({{
+          step: waveEnd,
+          kind: 'Settled',
+          label: 'Idle',
+          fullName: 'Flush complete / idle',
+          icon: ICONS.check,
+          cssClass: 'pill-idle'
+        }});
+      }}
 
       stages.sort((a, b) => a.step - b.step);
 
@@ -2412,8 +2391,10 @@ def format_reactlog_html(
         : curWave
         ? `Update ${{activeBurstIndex + 1}} of ${{allBursts.length}} · ${{curWave.humanAction || curWave.triggerLabel || 'Initial render'}}`
         : 'No recorded activity';
-      activeLabel.title = activeLabel.textContent;
       const ev = events[currentStep];
+      if (curWave?.recorded && !curWave.completed) activeLabel.textContent += ' (in progress)';
+      if ((ev?.action || ev?.event) === 'userMark') activeLabel.textContent = `Mark: ${{ev.node_label || ev.label || ev.details || ''}}`;
+      activeLabel.title = activeLabel.textContent;
       const status = document.getElementById('trace-status-line');
       status.textContent = ev ? (isIdleEvent(ev) ? 'Idle' : ['mark', 'userMark'].includes(ev.action || ev.event) ? `User mark${{ev.details ? ' · ' + ev.details : ''}}` : (ev.details || ev.action || ev.event || '')) : 'No events';
       status.title = status.textContent;
@@ -2482,7 +2463,7 @@ def format_reactlog_html(
     function getActiveFlushNodeIds(wave) {{
       if (!wave) return new Set();
       const set = new Set();
-      if (wave.isInit) {{
+      if (wave.isInit && !wave.recorded) {{
         (reactlogData.nodes || []).forEach(n => {{
           set.add(n.id);
           set.add(cleanName(n.id));
@@ -2681,7 +2662,7 @@ def format_reactlog_html(
 
 
       const badge = document.getElementById('flush-counter-badge');
-      if (badge) badge.textContent = `Update ${{curIdx + 1}} of ${{allBursts.length}}`;
+      if (badge) badge.textContent = `Update ${{curIdx + 1}} of ${{allBursts.length}}${{curWave.recorded && !curWave.completed ? ' (in progress)' : ''}}`;
       const pickerMenu = document.getElementById('flush-picker-menu');
       if (pickerMenu) {{
         pickerMenu.replaceChildren();
@@ -2708,7 +2689,7 @@ def format_reactlog_html(
 
       const cardTitle = document.getElementById('flush-card-title');
       if (cardTitle) {{
-        cardTitle.textContent = curWave.isInit ? 'Update 1: Initial render' : `Update ${{curIdx + 1}}: ${{curWave.shortLabel || 'Action'}}`;
+        cardTitle.textContent = `Update ${{curIdx + 1}}: ${{curWave.isInit ? 'Initialization' : curWave.shortLabel || 'Action'}}`;
       }}
       const cardTime = document.getElementById('flush-card-time');
       if (cardTime) {{
@@ -2762,7 +2743,7 @@ def format_reactlog_html(
         const roleKey = nodeRoleKey(n);
         if (lineage ? !lineage.has(n.id) : ((!activeRoles.has(roleKey) || !activeRoles.has(n.role)) || (searchQuery && !Number.isFinite(nodeSearchScore(n, searchQuery))))) return false;
         if (hideClientData && isClientDataNode(n)) return false;
-        if (active && active.size && !active.has(n.id) && !active.has(cleanName(n.id))) return false;
+        if (active && !active.has(n.id) && !active.has(cleanName(n.id))) return false;
         if (selectedStageFilter && wave) {{
           const members = selectedStageFilter === 'invalidated' ? wave.invalidatedNodes || new Set()
             : new Set((selectedStageFilter === 'calcs' ? wave.calcs || [] : wave.outputs || []).map(x => x.nodeId || x.name));
@@ -2826,7 +2807,6 @@ def format_reactlog_html(
         }}
       }});
       initTheme();
-      prepareEventTimings();
       buildGraphIndices();
       buildActionWaves();
 
@@ -3932,7 +3912,7 @@ def format_reactlog_html(
         const events = reactlogData.events || reactlogData.log || [];
         for (let i = 0; i < events.length; i++) {{
           const ev = events[i];
-          const t = ev.effective_time !== undefined ? ev.effective_time : ((ev.time_sec !== undefined ? ev.time_sec : ev.time) || 0);
+          const t = ev.time_sec ?? ev.time ?? 0;
           if (t <= curSec) matchIdx = i;
         }}
         if (matchIdx !== currentStep) {{
